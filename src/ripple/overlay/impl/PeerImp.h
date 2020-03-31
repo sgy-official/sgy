@@ -1,0 +1,507 @@
+
+
+#ifndef RIPPLE_OVERLAY_PEERIMP_H_INCLUDED
+#define RIPPLE_OVERLAY_PEERIMP_H_INCLUDED
+
+#include <ripple/app/consensus/RCLCxPeerPos.h>
+#include <ripple/basics/Log.h>
+#include <ripple/basics/RangeSet.h>
+#include <ripple/beast/asio/waitable_timer.h>
+#include <ripple/beast/utility/WrappedSink.h>
+#include <ripple/overlay/impl/ProtocolMessage.h>
+#include <ripple/overlay/impl/OverlayImpl.h>
+#include <ripple/peerfinder/PeerfinderManager.h>
+#include <ripple/protocol/Protocol.h>
+#include <ripple/protocol/STTx.h>
+#include <ripple/protocol/STValidation.h>
+#include <ripple/resource/Fees.h>
+
+#include <boost/endian/conversion.hpp>
+#include <boost/optional.hpp>
+#include <cstdint>
+#include <deque>
+#include <queue>
+#include <shared_mutex>
+
+namespace ripple {
+
+class PeerImp
+    : public Peer
+    , public std::enable_shared_from_this <PeerImp>
+    , public OverlayImpl::Child
+{
+public:
+    
+    enum class Type
+    {
+        legacy,
+        leaf,
+        peer
+    };
+
+    
+    enum class State
+    {
+        
+        connecting
+
+        
+        ,connected
+
+        
+        ,handshaked
+
+        
+        ,active
+    };
+
+    enum class Sanity
+    {
+        insane
+        ,unknown
+        ,sane
+    };
+
+    struct ShardInfo
+    {
+        beast::IP::Endpoint endpoint;
+        RangeSet<std::uint32_t> shardIndexes;
+    };
+
+    using ptr = std::shared_ptr <PeerImp>;
+
+private:
+    using clock_type    = std::chrono::steady_clock;
+    using error_code    = boost::system::error_code;
+    using socket_type   = boost::asio::ip::tcp::socket;
+    using stream_type   = boost::asio::ssl::stream <socket_type&>;
+    using address_type  = boost::asio::ip::address;
+    using endpoint_type = boost::asio::ip::tcp::endpoint;
+    using waitable_timer = boost::asio::basic_waitable_timer<std::chrono::steady_clock>;
+
+    static const size_t sslMinimumFinishedLength = 12;
+
+    Application& app_;
+    id_t const id_;
+    beast::WrappedSink sink_;
+    beast::WrappedSink p_sink_;
+    beast::Journal journal_;
+    beast::Journal p_journal_;
+    std::unique_ptr<beast::asio::ssl_bundle> ssl_bundle_;
+    socket_type& socket_;
+    stream_type& stream_;
+    boost::asio::strand<boost::asio::executor> strand_;
+    waitable_timer timer_;
+
+
+    beast::IP::Endpoint const remote_address_;
+
+    OverlayImpl& overlay_;
+    bool const m_inbound;
+    State state_;          
+    std::atomic<Sanity> sanity_;
+    clock_type::time_point insaneTime_;
+    bool detaching_ = false;
+    PublicKey const publicKey_;
+    std::string name_;
+    std::shared_timed_mutex mutable nameMutex_;
+
+    LedgerIndex minLedger_ = 0;
+    LedgerIndex maxLedger_ = 0;
+    uint256 closedLedgerHash_;
+    uint256 previousLedgerHash_;
+    std::deque<uint256> recentLedgers_;
+    std::deque<uint256> recentTxSets_;
+
+    boost::optional<std::chrono::milliseconds> latency_;
+    boost::optional<std::uint32_t> lastPingSeq_;
+    clock_type::time_point lastPingTime_;
+    clock_type::time_point const creationTime_;
+
+
+    std::mutex mutable recentLock_;
+    protocol::TMStatusChange last_status_;
+    protocol::TMHello const hello_;
+    Resource::Consumer usage_;
+    Resource::Charge fee_;
+    PeerFinder::Slot::ptr const slot_;
+    boost::beast::multi_buffer read_buffer_;
+    http_request_type request_;
+    http_response_type response_;
+    boost::beast::http::fields const& headers_;
+    boost::beast::multi_buffer write_buffer_;
+    std::queue<Message::pointer> send_queue_;
+    bool gracefulClose_ = false;
+    int large_sendq_ = 0;
+    int no_ping_ = 0;
+    std::unique_ptr <LoadEvent> load_event_;
+
+    std::mutex mutable shardInfoMutex_;
+    hash_map<PublicKey, ShardInfo> shardInfo_;
+
+    friend class OverlayImpl;
+
+public:
+    PeerImp (PeerImp const&) = delete;
+    PeerImp& operator= (PeerImp const&) = delete;
+
+    
+    PeerImp (Application& app, id_t id, endpoint_type remote_endpoint,
+        PeerFinder::Slot::ptr const& slot, http_request_type&& request,
+            protocol::TMHello const& hello, PublicKey const& publicKey,
+                Resource::Consumer consumer,
+                    std::unique_ptr<beast::asio::ssl_bundle>&& ssl_bundle,
+                        OverlayImpl& overlay);
+
+    
+    template <class Buffers>
+    PeerImp (Application& app, std::unique_ptr<beast::asio::ssl_bundle>&& ssl_bundle,
+        Buffers const& buffers, PeerFinder::Slot::ptr&& slot,
+            http_response_type&& response, Resource::Consumer usage,
+                protocol::TMHello const& hello,
+                    PublicKey const& publicKey, id_t id,
+                        OverlayImpl& overlay);
+
+    virtual
+    ~PeerImp();
+
+    beast::Journal const&
+    pjournal() const
+    {
+        return p_journal_;
+    }
+
+    PeerFinder::Slot::ptr const&
+    slot()
+    {
+        return slot_;
+    }
+
+    void
+    run();
+
+    void
+    stop() override;
+
+
+    void
+    send (Message::pointer const& m) override;
+
+    
+    template <class FwdIt, class = typename std::enable_if_t<std::is_same<
+        typename std::iterator_traits<FwdIt>::value_type,
+            PeerFinder::Endpoint>::value>>
+    void
+    sendEndpoints (FwdIt first, FwdIt last);
+
+    beast::IP::Endpoint
+    getRemoteAddress() const override
+    {
+        return remote_address_;
+    }
+
+    void
+    charge (Resource::Charge const& fee) override;
+
+
+    Peer::id_t
+    id() const override
+    {
+        return id_;
+    }
+
+    
+    bool
+    crawl() const;
+
+    bool
+    cluster() const override
+    {
+        return slot_->cluster();
+    }
+
+    void
+    check();
+
+    
+    void
+    checkSanity (std::uint32_t validationSeq);
+
+    void
+    checkSanity (std::uint32_t seq1, std::uint32_t seq2);
+
+    PublicKey const&
+    getNodePublic () const override
+    {
+        return publicKey_;
+    }
+
+    
+    std::string
+    getVersion() const;
+
+    clock_type::duration
+    uptime() const
+    {
+        return clock_type::now() - creationTime_;
+    }
+
+    Json::Value
+    json() override;
+
+
+    uint256 const&
+    getClosedLedgerHash () const override
+    {
+        return closedLedgerHash_;
+    }
+
+    bool
+    hasLedger (uint256 const& hash, std::uint32_t seq) const override;
+
+    void
+    ledgerRange (std::uint32_t& minSeq, std::uint32_t& maxSeq) const override;
+
+    bool
+    hasShard (std::uint32_t shardIndex) const override;
+
+    bool
+    hasTxSet (uint256 const& hash) const override;
+
+    void
+    cycleStatus () override;
+
+    bool
+    supportsVersion (int version) override;
+
+    bool
+    hasRange (std::uint32_t uMin, std::uint32_t uMax) override;
+
+    int
+    getScore (bool haveItem) const override;
+
+    bool
+    isHighLatency() const override;
+
+    void
+    fail(std::string const& reason);
+
+    
+    boost::optional<RangeSet<std::uint32_t>>
+    getShardIndexes() const;
+
+    
+    boost::optional<hash_map<PublicKey, ShardInfo>>
+    getPeerShardInfo() const;
+
+private:
+    void
+    close();
+
+    void
+    fail(std::string const& name, error_code ec);
+
+    void
+    gracefulClose();
+
+    void
+    setTimer();
+
+    void
+    cancelTimer();
+
+    static
+    std::string
+    makePrefix(id_t id);
+
+    void
+    onTimer (boost::system::error_code const& ec);
+
+    void
+    onShutdown (error_code ec);
+
+    void
+    doAccept();
+
+    http_response_type
+    makeResponse (bool crawl, http_request_type const& req,
+        beast::IP::Endpoint remoteAddress,
+        uint256 const& sharedValue);
+
+    void
+    onWriteResponse (error_code ec, std::size_t bytes_transferred);
+
+    std::string
+    getName() const;
+
+
+    void
+    doProtocolStart ();
+
+    void
+    onReadMessage (error_code ec, std::size_t bytes_transferred);
+
+    void
+    onWriteMessage (error_code ec, std::size_t bytes_transferred);
+
+public:
+
+    static
+    error_code
+    invalid_argument_error()
+    {
+        return boost::system::errc::make_error_code (
+            boost::system::errc::invalid_argument);
+    }
+
+    error_code
+    onMessageUnknown (std::uint16_t type);
+
+    error_code
+    onMessageBegin (std::uint16_t type,
+        std::shared_ptr <::google::protobuf::Message> const& m,
+        std::size_t size);
+
+    void
+    onMessageEnd (std::uint16_t type,
+        std::shared_ptr <::google::protobuf::Message> const& m);
+
+    void onMessage (std::shared_ptr <protocol::TMHello> const& m);
+    void onMessage (std::shared_ptr <protocol::TMManifests> const& m);
+    void onMessage (std::shared_ptr <protocol::TMPing> const& m);
+    void onMessage (std::shared_ptr <protocol::TMCluster> const& m);
+    void onMessage (std::shared_ptr <protocol::TMGetShardInfo> const& m);
+    void onMessage (std::shared_ptr <protocol::TMShardInfo> const& m);
+    void onMessage (std::shared_ptr <protocol::TMGetPeerShardInfo> const& m);
+    void onMessage (std::shared_ptr <protocol::TMPeerShardInfo> const& m);
+    void onMessage (std::shared_ptr <protocol::TMGetPeers> const& m);
+    void onMessage (std::shared_ptr <protocol::TMPeers> const& m);
+    void onMessage (std::shared_ptr <protocol::TMEndpoints> const& m);
+    void onMessage (std::shared_ptr <protocol::TMTransaction> const& m);
+    void onMessage (std::shared_ptr <protocol::TMGetLedger> const& m);
+    void onMessage (std::shared_ptr <protocol::TMLedgerData> const& m);
+    void onMessage (std::shared_ptr <protocol::TMProposeSet> const& m);
+    void onMessage (std::shared_ptr <protocol::TMStatusChange> const& m);
+    void onMessage (std::shared_ptr <protocol::TMHaveTransactionSet> const& m);
+    void onMessage (std::shared_ptr <protocol::TMValidation> const& m);
+    void onMessage (std::shared_ptr <protocol::TMGetObjectByHash> const& m);
+
+private:
+    State state() const
+    {
+        return state_;
+    }
+
+    void state (State new_state)
+    {
+        state_ = new_state;
+    }
+
+
+    void
+    addLedger (uint256 const& hash,
+        std::lock_guard<std::mutex> const& lockedRecentLock);
+
+    void
+    doFetchPack (const std::shared_ptr<protocol::TMGetObjectByHash>& packet);
+
+    void
+    checkTransaction (int flags, bool checkSignature,
+        std::shared_ptr<STTx const> const& stx);
+
+    void
+    checkPropose (Job& job,
+        std::shared_ptr<protocol::TMProposeSet> const& packet,
+            RCLCxPeerPos peerPos);
+
+    void
+    checkValidation (STValidation::pointer val,
+        std::shared_ptr<protocol::TMValidation> const& packet);
+
+    void
+    getLedger (std::shared_ptr<protocol::TMGetLedger> const&packet);
+
+    void
+    peerTXData (uint256 const& hash,
+        std::shared_ptr <protocol::TMLedgerData> const& pPacket,
+            beast::Journal journal);
+};
+
+
+
+template <class Buffers>
+PeerImp::PeerImp (Application& app, std::unique_ptr<beast::asio::ssl_bundle>&& ssl_bundle,
+    Buffers const& buffers, PeerFinder::Slot::ptr&& slot,
+        http_response_type&& response, Resource::Consumer usage,
+            protocol::TMHello const& hello,
+                PublicKey const& publicKey, id_t id,
+                    OverlayImpl& overlay)
+    : Child (overlay)
+    , app_ (app)
+    , id_ (id)
+    , sink_ (app_.journal("Peer"), makePrefix(id))
+    , p_sink_ (app_.journal("Protocol"), makePrefix(id))
+    , journal_ (sink_)
+    , p_journal_ (p_sink_)
+    , ssl_bundle_(std::move(ssl_bundle))
+    , socket_ (ssl_bundle_->socket)
+    , stream_ (ssl_bundle_->stream)
+    , strand_ (socket_.get_executor())
+    , timer_ (beast::create_waitable_timer<waitable_timer>(socket_))
+    , remote_address_ (slot->remote_endpoint())
+    , overlay_ (overlay)
+    , m_inbound (false)
+    , state_ (State::active)
+    , sanity_ (Sanity::unknown)
+    , insaneTime_ (clock_type::now())
+    , publicKey_ (publicKey)
+    , creationTime_ (clock_type::now())
+    , hello_ (hello)
+    , usage_ (usage)
+    , fee_ (Resource::feeLightPeer)
+    , slot_ (std::move(slot))
+    , response_(std::move(response))
+    , headers_(response_)
+{
+    read_buffer_.commit (boost::asio::buffer_copy(read_buffer_.prepare(
+        boost::asio::buffer_size(buffers)), buffers));
+}
+
+template <class FwdIt, class>
+void
+PeerImp::sendEndpoints (FwdIt first, FwdIt last)
+{
+    protocol::TMEndpoints tm;
+    for (;first != last; ++first)
+    {
+        auto const& ep = *first;
+        protocol::TMEndpoint& tme (*tm.add_endpoints());
+        if (ep.address.is_v4())
+            tme.mutable_ipv4()->set_ipv4(
+                boost::endian::native_to_big(
+                    static_cast<std::uint32_t>(ep.address.to_v4().to_ulong())));
+        else
+            tme.mutable_ipv4()->set_ipv4(0);
+        tme.mutable_ipv4()->set_ipv4port (ep.address.port());
+        tme.set_hops (ep.hops);
+
+        auto& tme2 (*tm.add_endpoints_v2());
+        tme2.set_endpoint(ep.address.to_string());
+        tme2.set_hops (ep.hops);
+    }
+    tm.set_version (2);
+
+    send (std::make_shared <Message> (tm, protocol::mtENDPOINTS));
+}
+
+}
+
+#endif
+
+
+
+
+
+
+
+

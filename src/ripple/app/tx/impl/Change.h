@@ -1,0 +1,60 @@
+
+
+#ifndef RIPPLE_TX_CHANGE_H_INCLUDED
+#define RIPPLE_TX_CHANGE_H_INCLUDED
+
+#include <ripple/app/main/Application.h>
+#include <ripple/app/misc/AmendmentTable.h>
+#include <ripple/app/misc/NetworkOPs.h>
+#include <ripple/app/tx/impl/Transactor.h>
+#include <ripple/basics/Log.h>
+#include <ripple/protocol/Indexes.h>
+
+namespace ripple {
+
+class Change
+    : public Transactor
+{
+public:
+    explicit Change (ApplyContext& ctx)
+        : Transactor(ctx)
+    {
+    }
+
+    static
+    NotTEC
+    preflight (PreflightContext const& ctx);
+
+    TER doApply () override;
+    void preCompute() override;
+
+    static
+    std::uint64_t
+    calculateBaseFee (
+        ReadView const& view,
+        STTx const& tx)
+    {
+        return 0;
+    }
+
+    static
+    TER
+    preclaim(PreclaimContext const &ctx);
+
+private:
+    TER applyAmendment ();
+
+    TER applyFee ();
+};
+
+}
+
+#endif
+
+
+
+
+
+
+
+
