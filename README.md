@@ -9,6 +9,9 @@ Singularity is an open source project, initiated by sGY Geek Tribal Decentraliza
 In the future, Singularity will combine SGY Ecology to reflect a more diverse range of DeFi and DApp applications.
 
 Official website: https://www.sgy.plus
+
 Blockchain Browser: https://explorer.sgy.plus
+
 Open source address: https://github.com/sgy-official
+
 SGY Tribal Email: community@sgy.plus
